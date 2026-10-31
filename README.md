@@ -9,6 +9,8 @@ Select tasks and press **Start**, and each one gets its own git worktree and a c
 
 - Lists every task in your Kaneo workspaces: each column, planned tasks too, open work first. It leaves out archived tasks.
 - Filter by `Open`, by any of your columns (custom ones too), or by id, title, project, status or assignee.
+- 40 tasks a page, so big boards stay quick. Loaded tasks are shared between the docked panel and the popup
+  and kept across restarts, so the panel opens with your tasks already there and refreshes in the background.
 - Click a task's id to open it in Kaneo.
 - **▶ Start** on a task, or select several and **▶ Start N agents**. Each task gets a worktree on a branch
   like `web-7-fix-the-login-bug` and an agent whose first message is the task. Kaneo's GitHub integration
@@ -83,8 +85,9 @@ Or export `KANEO_URL` and `KANEO_API_KEY` in your shell instead. Everything else
 
 - **Network:** only your Kaneo instance (your key is sent nowhere else), plus `git fetch` and `git clone`
   when an agent starts.
-- **Rate limit:** Kaneo allows each API key 100 requests a minute. The panel uses about 7 per minute, caches
-  each project's git link for an hour, and waits out a rate limit instead of retrying.
+- **Rate limit:** Kaneo allows each API key 100 requests a minute. However many copies of the panel are open,
+  only one reloads each minute (a few requests per project). Each project's git link is cached for an hour, and
+  a rate limit is waited out instead of retried.
 - **Programs:** `git`, `sh` (finding repos, reading `KANEO_*`), the agents' CLIs (listing models) and your
   system's URL opener.
 - **Files:** reads `~/.config/herdr-app/kaneo.json`. Lists git checkouts under the repo roots and reads their

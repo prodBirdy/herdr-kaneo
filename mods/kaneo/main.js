@@ -19,6 +19,14 @@ const DESCRIPTION_PAGES = 5;
 const PICKED = "kaneo.repos";
 const LINKS = "kaneo.links";
 const LINKS_MS = 60 * 60 * 1000;
+const CACHE = "kaneo.cache";
+const LOCK = "kaneo.loading";
+const FRESH_MS = 50000;
+const LOCK_MS = 30000;
+const DESCRIPTION_KEEP = 2000;
+
+// What the shared cache keeps of a task: a long description is fetched again when an agent starts.
+const slim = (i) => (i.description && i.description.length > DESCRIPTION_KEEP ? { ...i, description: null, descriptionDeferred: true } : i);
 const PROVIDERS = ["github", "gitlab", "gitea"];
 const NO_URL = "No Kaneo URL. Add \"url\" to ~/.config/herdr-app/kaneo.json or set KANEO_URL.";
 const NO_KEY = "No Kaneo API key. Add \"apiKey\" to ~/.config/herdr-app/kaneo.json or set KANEO_API_KEY.";
@@ -116,15 +124,17 @@ async function fullDescription(config, issue) {
 const PRIORITY_COLORS = { urgent: "ansi1", high: "working" };
 const STATUS_COLORS = { "to-do": "dim", "in-progress": "working", "in-review": "accent", planned: "muted" };
 const RUNNING = ["starting", "ready", "started"];
+// Rows drawn at once: a long board stays quick to redraw, and the rest is a page away.
+const PAGE_SIZE = 40;
 
 export default class Kaneo extends View {
   init(_props, cx) {
     this.issues = []; this.projects = []; this.links = {}; this.scan = null;
     this.status = "open"; this.text = ""; this.generation = 0; this.loading = false;
     this.selected = new Set(); this.runs = {}; this.starting = false; this.opening = null;
-    this.view = "tasks"; this.pick = null; this.repoText = ""; this.cloneError = null;
+    this.view = "tasks"; this.pick = null; this.page = 0; this.repoText = ""; this.cloneError = null;
     this.search = InputState.new({ placeholder: "Filter" });
-    this.search.on("change", (_e, cx) => { this.text = this.search.value(); cx.notify(); });
+    this.search.on("change", (_e, cx) => { this.text = this.search.value(); this.page = 0; cx.notify(); });
     this.repoFilter = InputState.new({ placeholder: "Filter repos" });
     this.repoFilter.on("change", (_e, cx) => { this.repoText = this.repoFilter.value(); cx.notify(); });
     this.cloneInput = InputState.new({ placeholder: "git@github.com:owner/repo.git" });
@@ -141,20 +151,26 @@ export default class Kaneo extends View {
     });
   }
 
-  // Tasks every minute; the repo scan and Kaneo's git links on open and on Refresh (links cached
-  // for an hour, so reloads don't spend the API key's 100 requests a minute). After a rate limit,
+  // Tasks live in shared state (CACHE), so every copy (a docked panel, the popup) shows the last load at
+  // once, and only one copy asks Kaneo each minute (LOCK); Herdr's fetch takes a second or two a request.
+  // The repo scan and Kaneo's git links (cached an hour) run on open and on Refresh. After a rate limit
   // nothing is asked until its reset.
   refresh(cx, repos = false, force = false) {
-    if (!force && this.pausedUntil && Date.now() < this.pausedUntil) return;
+    const cache = shared(CACHE), now = Date.now();
+    if (!force && cache?.pausedUntil > now) return;
+    const loadTasks = force || !(cache && now - cache.at < FRESH_MS) && !(now - (shared(LOCK) ?? 0) < LOCK_MS);
+    if (!loadTasks && !(repos && !this.scan) && this.config) return;
     const generation = ++this.generation;
-    this.loading = true;
+    this.loading = loadTasks;
+    if (loadTasks) setShared(LOCK, now);
     cx.spawn(async (cx) => {
       try {
-        const config = await loadConfig();
-        this.config = config;
+        if (!this.config || force) this.config = await loadConfig();
+        const config = this.config;
+        this.localError = null;
         if (config.error) throw new Error(config.error);
         if (config.demo) {
-          this.issues = demoIssues(); this.projects = DEMO_PROJECTS; this.error = null; this.loading = false;
+          this.issues = demoIssues(); this.projects = DEMO_PROJECTS; this.loading = false;
           cx.notify();
           if (repos) this.scan = await scanRepos(config);
           return;
@@ -162,14 +178,13 @@ export default class Kaneo extends View {
         if (!config.url) throw new Error(NO_URL);
         if (!config.apiKey) throw new Error(NO_KEY);
         if (repos) this.repoLoad = scanRepos(config);
-        const { issues, projects, workspaces } = await fetchIssues(config);
-        if (generation === this.generation) {
-          this.issues = issues; this.projects = projects; this.error = workspaces ? null : "No matching Kaneo workspace";
-          const ids = new Set(issues.map((i) => i.id));
-          for (const id of this.selected) if (!ids.has(id)) this.selected.delete(id);
+        if (loadTasks) {
+          const { issues, projects, workspaces } = await fetchIssues(config);
+          setShared(CACHE, { at: Date.now(), url: config.url, issues: issues.map(slim), projects,
+            error: workspaces ? null : "No matching Kaneo workspace" });
         }
-        this.pausedUntil = null; this.notice = null;
         if (repos) {
+          const projects = shared(CACHE)?.projects ?? [];
           const cached = shared(LINKS);
           const fresh = !force && cached && Date.now() - cached.at < LINKS_MS && projects.every((p) => p.id in (cached.checked ?? {}));
           const links = fresh ? cached.links : await fetchLinks(config, projects);
@@ -177,19 +192,35 @@ export default class Kaneo extends View {
           this.scan = await this.repoLoad; this.links = links;
         }
       } catch (e) {
-        if (generation !== this.generation) return;
+        const message = String(e.message ?? e), prev = shared(CACHE) ?? { issues: [], projects: [] };
         if (e.retryAt) {
-          this.pausedUntil = e.retryAt;
           const at = new Date(e.retryAt).toTimeString().slice(0, 5);
-          this.notice = `Kaneo rate limit reached; trying again after ${at}`;
-          if (!this.issues.length) this.error = this.notice;
+          setShared(CACHE, { ...prev, at: Date.now(), pausedUntil: e.retryAt, notice: `Kaneo rate limit reached; trying again after ${at}` });
           this.links = shared(LINKS)?.links ?? this.links;
           this.scan = await this.repoLoad?.catch(() => null) ?? this.scan;
-        } else this.error = String(e.message ?? e);
+        } else if (loadTasks && this.config?.url && this.config?.apiKey && !this.config?.error) {
+          setShared(CACHE, { ...prev, at: Date.now(), url: this.config.url, error: message });
+        } else this.localError = message;
+      } finally {
+        if (loadTasks) setShared(LOCK, 0);
+        if (generation === this.generation) this.loading = false;
+        cx.notify();
       }
-      finally { if (generation === this.generation) this.loading = false; cx.notify(); }
     });
     cx.notify();
+  }
+
+  // The shared tasks, when they're from this instance (demo mode keeps its own).
+  syncCache() {
+    if (this.config?.demo) return;
+    const c = shared(CACHE);
+    if (!c || (this.config?.url && c.url && c.url !== this.config.url)) return;
+    this.error = c.error ?? null;
+    this.notice = c.pausedUntil > Date.now() ? c.notice : null;
+    if (c.at === this.cacheAt) return;
+    this.cacheAt = c.at; this.issues = c.issues ?? []; this.projects = c.projects ?? [];
+    const ids = new Set(this.issues.map((i) => i.id));
+    for (const id of this.selected) if (!ids.has(id)) this.selected.delete(id);
   }
 
   cloneRoot() {
@@ -303,7 +334,7 @@ export default class Kaneo extends View {
     const active = this.status === status.id;
     return h_flex().id(`status-${status.id}`).h(24).px(8).flex_none().items_center().rounded(6).cursor_pointer().text_size(11)
       .bg(active ? t.selected : t.raised).text_color(active ? t.foreground : t.muted)
-      .hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.status = status.id; cx.notify(); }).child(status.label);
+      .hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.status = status.id; this.page = 0; cx.notify(); }).child(status.label);
   }
 
   checkbox(on, t) {
@@ -370,12 +401,13 @@ export default class Kaneo extends View {
   selectionBar(list, t) {
     const chosen = this.issues.filter((i) => this.selected.has(i.id));
     const allShown = list.length > 0 && list.every((i) => this.selected.has(i.id));
+    const label = this.pages > 1 ? "page" : "shown";
     return v_flex().flex_none().px(10).py(8).gap(6).border_t(1).border_color(t.border).bg(t.chrome).text_size(11)
       .child(h_flex().gap(6).items_center().min_w(0)
         .child(div().flex_none().font_semibold().text_color(t.foreground).child(`${chosen.length} selected`))
         .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(this.choiceText())))
       .child(h_flex().gap(4).items_center()
-        .child(this.button("select-shown", allShown ? "Unselect shown" : "Select shown", (_e, cx) => {
+        .child(this.button("select-shown", allShown ? `Unselect ${label}` : `Select ${label}`, (_e, cx) => {
           for (const i of list) if (allShown) this.selected.delete(i.id); else this.selected.add(i.id);
           cx.notify();
         }, t))
@@ -385,6 +417,21 @@ export default class Kaneo extends View {
           .bg(this.starting ? t.raised : t.solid).text_color(this.starting ? t.dim : t.solid_foreground)
           .on_click((_e, cx) => this.startAgents(chosen, cx))
           .child(this.starting ? "Starting…" : `▶ Start ${chosen.length} agent${chosen.length > 1 ? "s" : ""}`)));
+  }
+
+  pager(total, t) {
+    const from = this.page * PAGE_SIZE + 1, to = Math.min(total, from + PAGE_SIZE - 1);
+    const go = (id, label, enabled, page) => div().id(id).flex_none().px(8).h(24).flex().items_center().rounded(6).text_size(11)
+      .text_color(enabled ? t.foreground : t.dim).when(enabled, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover))
+        .on_click((_e, cx) => { this.page = page; cx.notify(); }))
+      .child(label);
+    return h_flex().flex_none().h(34).px(10).gap(4).items_center().border_t(1).border_color(t.border).text_size(11)
+      .child(div().flex_1().text_color(t.dim).child(`${from}–${to} of ${total}`))
+      .child(go("page-first", "«", this.page > 0, 0))
+      .child(go("page-prev", "‹ Prev", this.page > 0, this.page - 1))
+      .child(div().flex_none().px(4).text_color(t.muted).child(`${this.page + 1} / ${this.pages}`))
+      .child(go("page-next", "Next ›", this.page < this.pages - 1, this.page + 1))
+      .child(go("page-last", "»", this.page < this.pages - 1, this.pages - 1));
   }
 
   short(path) {
@@ -442,22 +489,30 @@ export default class Kaneo extends View {
   }
 
   emptyText() {
-    if (this.error) return this.error;
-    if (this.loading) return "Loading…";
+    if (this.localError ?? this.error) return this.localError ?? this.error;
+    if (this.loading || this.othersLoading()) return "Loading…";
     return this.issues.length ? "No tasks match these filters" : "No tasks yet";
   }
 
+  othersLoading() {
+    return Date.now() - (shared(LOCK) ?? 0) < LOCK_MS;
+  }
+
   render() {
+    this.syncCache();
     const t = theme(), chips = statusChips(this.issues), repos = this.view === "repos";
     if (!chips.some((c) => c.id === this.status)) this.status = "all";
     const list = filterIssues(this.issues, { status: this.status, text: this.text });
+    this.pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+    this.page = Math.min(this.page, this.pages - 1);
+    const shown = list.slice(this.page * PAGE_SIZE, (this.page + 1) * PAGE_SIZE);
     const open = this.issues.filter((i) => !i.done).length;
     return v_flex().id("kaneo").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(13)
       .child(h_flex().h(42).flex_none().px(14).gap(6).items_center().border_b(1).border_color(t.border)
         .child(div().flex_none().font_semibold().child("Kaneo"))
         .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(`${open} open · ${this.issues.length} tasks`))
         .child(this.button("repos", "Repos", (_e, cx) => { this.view = repos ? "tasks" : "repos"; this.pick = null; cx.notify(); }, t, repos))
-        .child(this.button("refresh", this.loading ? "…" : "Refresh", (_e, cx) => this.refresh(cx, true, true), t)))
+        .child(this.button("refresh", this.loading || this.othersLoading() ? "…" : "Refresh", (_e, cx) => this.refresh(cx, true, true), t)))
       .when(Boolean(this.notice) && this.issues.length > 0, (e) => e.child(div().flex_none().px(14).py(5).text_size(11)
         .text_color(t.working).border_b(1).border_color(t.border).child(this.notice ?? "")))
       .when(repos, (e) => e.child(this.reposView(t)))
@@ -467,9 +522,10 @@ export default class Kaneo extends View {
           .child(div().w(130).flex_none().h(24).px(8).flex().items_center().rounded(6).border_1()
             .border_color(this.text.trim() ? t.accent : t.border).bg(t.background)
             .child(Input.new(this.search).h_full().text_size(11).text_color(t.foreground))))
-        .child(v_flex().id("kaneo-list").flex_1().min_h(0).overflow_y_scrollbar().p(6).gap(2)
-          .children(list.map((issue) => this.row(issue, t)))
-          .when(!list.length, (e) => e.child(div().p(8).text_color(this.error ? t.ansi1 : t.dim).child(this.emptyText()))))
-        .when(this.selected.size > 0, (e) => e.child(this.selectionBar(list, t))));
+        .child(v_flex().id(`kaneo-list-${this.page}`).flex_1().min_h(0).overflow_y_scrollbar().p(6).gap(2)
+          .children(shown.map((issue) => this.row(issue, t)))
+          .when(!list.length, (e) => e.child(div().p(8).text_color(this.localError ?? this.error ? t.ansi1 : t.dim).child(this.emptyText()))))
+        .when(this.pages > 1, (e) => e.child(this.pager(list.length, t)))
+        .when(this.selected.size > 0, (e) => e.child(this.selectionBar(shown, t))));
   }
 }

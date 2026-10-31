@@ -34,9 +34,12 @@ Top to bottom:
     pills (5px padding, radius 4, a border in the label's color at 53% alpha). On the right: the assignee or
     `Unassigned`, and `· due 3d`, `· due 5h` or `· 2d overdue` (`ansi1` unless done).
   - A third line in `ansi1` with the reason when a start failed.
+- **Pager** (only with more than 40 matching tasks), 34px, a `border` line above, 11px: `41–80 of 230` in
+  `dim`, then `«`, `‹ Prev`, `2 / 6` in `muted`, `Next ›` and `»`. They're `dim` and inactive at either end.
+  A filter or chip change goes back to page 1. Each page has its own scroll position, so it starts at the top.
 - **Selection bar** (only with something selected), on `chrome` with a `border` line above, 10×8 padding,
   11px. Line one: `3 selected` semibold, then what Start runs with in `dim` (`claude · opus · high`, or
-  `Claude Code, its defaults · ⋯ on a task to change`). Line two: `Select shown`/`Unselect shown`, `Clear`,
+  `Claude Code, its defaults · ⋯ on a task to change`). Line two: `Select shown`/`Unselect shown` (`… page` when paged, for the page shown), `Clear`,
   then a 28px `solid` button `▶ Start 3 agents` (`Starting…` while it works).
 - In place of the list: `Loading…`, `No tasks yet`, `No tasks match these filters`, or in `ansi1` the missing
   URL or key message, `Invalid Kaneo API key`, `kaneo.json is not valid JSON` or Kaneo's own message.
@@ -67,8 +70,12 @@ footer has the error in `ansi1`, `Cancel` and `Start agent` in `solid`.
   slug, done = `isFinal`) and `data.plannedTasks`, never `archivedTasks`, and drops duplicates by id.
   Workspaces can be narrowed with `workspaces` (slug or id). Order: in progress, in review, to do, custom,
   planned, done; then priority, then number from newest.
-- It reloads on open, every 60 s, on `Refresh` and on `kaneo.refresh`. A load that finishes after a newer
-  one started is dropped.
+- **Shared loading:** loaded tasks go into shared `kaneo.cache` as `{ at, url, issues, projects, error }`.
+  Descriptions over 2000 characters are dropped there and fetched again on Start. Every copy draws from the
+  cache, so a new popup shows the last load at once, even after a restart. On open and every 60 s, a copy
+  loads only when the cache is over 50 s old and no other copy holds `kaneo.loading` (a timestamp, stale
+  after 30 s). `Refresh` and `kaneo.refresh` always load. `kaneo.json` is read on open and on Refresh,
+  not every minute. Herdr's `fetch` takes 1–2 s a request, so this is what keeps the panel quick.
 - **Auth:** `Authorization: Bearer <apiKey>`, sent only to `apiUrl` (default `<url>/api`). `url`/`apiKey`
   come from `~/.config/herdr-app/kaneo.json`, else `KANEO_URL`/`KANEO_API_KEY` from the shell agents start
   in.
@@ -128,6 +135,7 @@ footer has the error in `ansi1`, `Cancel` and `Start agent` in `solid`.
 
 ## Watch out
 
+- Draw only the page shown (40 rows): every change to Herdr's live data redraws the mod.
 - Kaneo's assigned-tasks endpoint caps at 100 tasks. This mod reads the boards instead, so every task shows.
 - Board pages and planned/archived pages count separately (`page`, `relatedPage`). Ask for both and drop
   duplicates.
